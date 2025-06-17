@@ -1,17 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
-	"sort"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
-type ScanHostOptions struct {
+type ScanOptions struct {
 	Host    string
 	Workers int
 	To      int
@@ -20,74 +21,94 @@ type ScanHostOptions struct {
 }
 
 func main() {
-	var debugFlag = flag.Bool("debug", false, "debug")
-	var host = flag.String("host", "google.com", "host")
-	var from = flag.Int("from", 1, "from port")
-	var to = flag.Int("to", 65535, "to port")
-	var workers = flag.Int("workers", 10, "workers count")
-	var _ = flag.Int("timeout", 200, "timeout in milliseconds")
+	var host = flag.String("host", "google.com", "target hostname or IP address")
+	var from = flag.Int("from", 1, "starting port number to scan (inclusive)")
+	var to = flag.Int("to", 65535, "ending port number to scan (inclusive)")
+	var workers = flag.Int("workers", 10, "number of concurrent scanning workers")
+	var timeout = flag.Int("timeout", 200, "timeout per port scan in milliseconds")
 
 	flag.Parse()
+	opts := &ScanOptions{*host, *workers, *to, *from, time.Duration(*timeout) * time.Millisecond}
 
-	logLevel := slog.LevelInfo
-	if *debugFlag {
-		logLevel = slog.LevelDebug
-	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	fmt.Printf("Opened ports: %v\n", ScanHost(&ScanHostOptions{
-		Host:    *host,
-		Workers: *workers,
-		To:      *to,
-		From:    *from,
-		Timeout: 200 * time.Millisecond,
-	}))
-}
-
-func scanHostWorker(opt *ScanHostOptions, id int, portsCh chan int, resultsCh chan int, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for p := range portsCh {
-		address := fmt.Sprintf("%s:%d", opt.Host, p)
-		slog.Debug("scanning", "workerId", id, "port", p)
-		conn, err := net.DialTimeout("tcp", address, opt.Timeout)
-		if err == nil {
-			slog.Debug("close", "workerId", id, "port", p)
-			conn.Close()
-			resultsCh <- p
-		}
-	}
-}
-
-func ScanHost(opt *ScanHostOptions) []int {
-	portsCh := make(chan int, opt.Workers)
-	resultsCh := make(chan int)
-
-	var wg sync.WaitGroup
-
-	for id := range opt.Workers {
-		wg.Add(1)
-		go scanHostWorker(opt, id, portsCh, resultsCh, &wg)
-	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		for i := opt.From; i <= opt.To; i++ {
-			portsCh <- i
-		}
-		close(portsCh)
+		<-sigCh
+		fmt.Println("\nReceived interrupt. Shutting down...")
+		cancel()
 	}()
+
+	portCh := generatePorts(ctx, *from, *to)
+	openedPortCh := scanPorts(ctx, opts, portCh)
+
+	for {
+		select {
+		case port, ok := <-openedPortCh:
+			if !ok {
+				return
+			}
+			fmt.Printf("%d: opened\n", port)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func generatePorts(ctx context.Context, from, to int) chan int {
+	outCh := make(chan int)
+
+	go func() {
+		defer close(outCh)
+
+		for port := from; port < to; port++ {
+			select {
+			case outCh <- port:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return outCh
+}
+
+func scanPorts(ctx context.Context, opts *ScanOptions, inCh chan int) chan int {
+	var wg sync.WaitGroup
+	outCh := make(chan int)
+
+	wg.Add(opts.Workers)
+	for range opts.Workers {
+		go scanPortsWorker(ctx, opts, inCh, outCh, &wg)
+	}
 
 	go func() {
 		wg.Wait()
-		close(resultsCh)
+		close(outCh)
 	}()
 
-	var openedPorts []int
+	return outCh
+}
 
-	for p := range resultsCh {
-		openedPorts = append(openedPorts, p)
+func scanPortsWorker(ctx context.Context, opts *ScanOptions, inCh chan int, outCh chan int, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for port := range inCh {
+		address := fmt.Sprintf("%s:%d", opts.Host, port)
+		conn, err := net.Dial("tcp", address)
+		if err != nil {
+			continue
+		}
+
+		_ = conn.Close()
+
+		select {
+		case outCh <- port:
+		case <-ctx.Done():
+			return
+		}
 	}
-
-	sort.Ints(openedPorts)
-	return openedPorts
 }
